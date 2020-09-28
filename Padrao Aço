@@ -1,0 +1,119 @@
+#Leitura dos dados---------------------------------------------------------------------------------------------
+amaco_rep <- read.table(file = 'd:/AMACO_REP.txt', header = TRUE, sep='\t',dec = ".", stringsAsFactors = FALSE)
+#-------------------------------------------------------------------------------------------------------------
+amaco_rep$pc_anq_elq_ae<-amaco_rep$pc_anq_elq_al
+amaco_rep$pc_anq_elq_b<-amaco_rep$pc_anq_elq_ca
+
+names(amaco_rep)[1]<-'ChaveAmaco'
+campos_importantes<-c('ChaveAmaco',paste0('pc_anq_elq_',tolower(c('C','Si','Mn','S','P','Al','Ti','Nb','V','Cr','Cu','Ni','Mo','B','N','Sb','Ca','Ae'))))
+amaco_rep<-amaco_rep[,campos_importantes]
+amaco_rep$pc_anq_elq_al<-ifelse(is.na(amaco_rep$pc_anq_elq_al),amaco_rep$pc_anq_elq_ae,amaco_rep$pc_anq_elq_al)
+amaco_rep[2:19]<-data.frame(lapply(amaco_rep[2:19], function(x) as.numeric(gsub(",",".",x))))
+amaco_rep[is.na(amaco_rep)]<-0
+
+
+#casas decimais
+ndecimais<-data.frame(strsplit(c('C;4','Si;3','Mn;2','S;4','P;3','Al;3','Ti;3','Nb;3','V;3','Cr;2','Cu;2','Ni;2','Mo;3','B;4','N;0','Sb;3','Ca;4'),';'),stringsAsFactors = F)
+for(i in 1:NCOL(ndecimais)){names(ndecimais)[i]<-paste0(ndecimais[1,i,drop=F])}
+
+#renomeando os campos
+elementos<-c('C','Si','Mn','S','P','Al','Ti','Nb','V','Cr','Cu','Ni','Mo','B','N','Sb','Ca')
+for (elemento in elementos){names(amaco_rep)[names(amaco_rep) ==paste0('pc_anq_elq_',tolower(elemento))]<-paste0(elemento)}
+
+#excluindo dados absurdos
+amaco_rep<-amaco_rep[amaco_rep$C<=1.5 & amaco_rep$Mn<=5.0 & amaco_rep$Al<=2.5 & amaco_rep$S<=0.06  & amaco_rep$Nb<=0.2 & amaco_rep$V<=0.5 & amaco_rep$Ti<=0.5,]
+
+#cluster do conjunto
+groupby<-c('C;8','Mn;7','Si;4','Nb;5','Ti;6','V;2','Cu;2','Cr;2','Ni;2','Mo;2','P;2','Sb;2','Al;2','B;2')
+amaco_rep$cluster_kmeans<-""
+for (coluna in groupby){		
+  set.seed(123)
+  n_clusters<-as.numeric(unlist(strsplit(coluna,';'))[2])
+  coluna<-unlist(strsplit(coluna,';'))[1]
+  ndecimal<-as.numeric(ndecimais[2,coluna])
+  amaco_rep[,coluna]<-round(amaco_rep[,coluna],ndecimal) #arredonda para evitar criacao de clusters de variacao irrelevante
+  datasetCluster<-kmeans(scale(amaco_rep[,coluna,drop=FALSE]), centers = n_clusters, iter.max = 20, nstart = 17,algorithm = c("Hartigan-Wong"))
+  amaco_rep$cluster_kmeans <- paste(amaco_rep$cluster_kmeans, paste(coluna,".",datasetCluster$cluster,";", sep=""), sep="")}
+
+#faz algumas agregacoes do cluster para colocar no dataframe principal
+detalhe_cluster<- aggregate(N ~ cluster_kmeans, data=amaco_rep,FUN= length)
+names(detalhe_cluster)[2]<-'Qtde_clusters'
+detalhe_cluster<-detalhe_cluster[order(detalhe_cluster$Qtde_clusters,decreasing = T),]
+detalhe_cluster$cluster_simples <- seq(1:NROW(detalhe_cluster))
+amaco_rep<-merge(amaco_rep,detalhe_cluster)
+
+library(randomForest)
+#estimando propriedade mecânica (considerado TB e espessura de esboço fixa)
+amaco_rep$TB<-625
+amaco_rep$EP_SHTBR<-39
+
+#Estimando LE para diferentes espessuras por composiçao química
+modelrfLE <- readRDS("modeloLE.rds")
+for(ep in c(2,6,12,18)){
+  amaco_rep$EP_BQ<-ep
+  y_pred<-predict(modelrfLE, newdata = amaco_rep)
+  amaco_rep[paste0('LE_TB625_',ep,'mm')]<-round(as.vector(y_pred),0)}
+
+#Estimando LR para diferentes espessuras por composiçao química
+modelrfLR <- readRDS("modeloLR.rds")
+for(ep in c(2,6,12,18)){
+  amaco_rep$EP_BQ<-ep
+  y_pred<-predict(modelrfLR, newdata = amaco_rep)
+  amaco_rep[paste0('LR_TB625_',ep,'mm')]<-round(as.vector(y_pred),0)}
+
+#Estimando probabilidadae de BS por composiçao química
+amaco_rep$N<-amaco_rep$N/10000
+amaco_rep$CorteL_sqrt<-sqrt(100)
+amaco_rep$C_Ti<-amaco_rep$C*amaco_rep$Ti
+amaco_rep$Mn_S<-amaco_rep$Mn*amaco_rep$S
+amaco_rep$N_Al<-amaco_rep$N*amaco_rep$Al
+amaco_rep$N_V<-amaco_rep$N*amaco_rep$V
+amaco_rep$C_Cr<-amaco_rep$C*amaco_rep$Cr
+amaco_rep$C_Mo<-amaco_rep$C*amaco_rep$Mo
+
+modelBS <- readRDS("modeloBS.rds")
+y_pred<-predict(modelBS, newdata = amaco_rep,type="prob")
+amaco_rep$ProbBS_100mm<-round(as.vector(y_pred[,'Y']),2)
+
+amaco_rep$CorteL_sqrt<-sqrt(50)
+y_pred<-predict(modelBS, newdata = amaco_rep,type="prob")
+amaco_rep$ProbBS_50mm<-round(as.vector(y_pred[,'Y']),2)
+
+#removendo os modelos da memória
+rm(modelBS,modelrfLE,modelrfLR,y_pred)
+
+
+#faz um cluster padrao kmeans com metade da quantidade de clusters e faz merge no dataframe padrao
+detalhe_cluster<- aggregate(cbind(C,Si,Mn,Nb,Ti,V,Cu,Cr,Ni,Mo,Al,B,P,Sb) ~ cluster_kmeans, data=amaco_rep,FUN= mean)
+datasetCluster<-kmeans(scale(detalhe_cluster[,-1]), centers = round(NROW(detalhe_cluster)*0.5,1), iter.max = 20, nstart = 17,algorithm = c("Hartigan-Wong"))
+detalhe_cluster$cluster_padrao <-datasetCluster$cluster
+detalhe_cluster<-detalhe_cluster[,c('cluster_kmeans','cluster_padrao')]
+amaco_rep<-merge(amaco_rep,detalhe_cluster)
+
+#clusters individuais
+groupby<-c('C;13','Mn;13','Si;9','Nb;9','Ti;9','V;3','Cu;2','Cr;5','Ni;3','Mo;3','P;5','Sb;2','Al;4','S;5','N;5','Ca;3','B;3','LE_TB625_6mm;5','LR_TB625_6mm;5','ProbBS_100mm;3')
+for (coluna in groupby){		
+  set.seed(123)
+  n_clusters<-as.numeric(unlist(strsplit(coluna,';'))[2])
+  coluna<-unlist(strsplit(coluna,';'))[1]
+  datasetCluster<-kmeans(scale(amaco_rep[,coluna,drop=FALSE]), centers = n_clusters, iter.max = 20, nstart = 17,algorithm = c("Hartigan-Wong"))
+  amaco_rep[,paste0('kmeans_',coluna,n_clusters)] <- paste(coluna,".",datasetCluster$cluster, sep="")
+  
+  formula_aggregate<- as.formula(paste(coluna, "~", paste0('kmeans_',coluna,n_clusters)))
+  ndecimal<-as.numeric(ifelse(is.null(ndecimais[2,coluna]),2,ndecimais[2,coluna]))
+  detalhe_cluster<- aggregate(formula_aggregate, data=amaco_rep,FUN= {function(x) as.numeric(format(round(mean(x),ndecimal),nsmall=ndecimal))})
+  names(detalhe_cluster)[2]<-"temp"
+  amaco_rep<-merge(amaco_rep,detalhe_cluster)
+  amaco_rep[,paste0('kmeans_',coluna,n_clusters)]<-amaco_rep$temp
+  amaco_rep$temp<-NULL}
+
+
+#deixando somente campos relevantes no dataframe que será salvo
+amaco_rep<-amaco_rep[,c('ChaveAmaco','cluster_kmeans','cluster_simples','Qtde_clusters','cluster_padrao','kmeans_C13',
+                        'kmeans_Mn13','kmeans_Si9','kmeans_Nb9','kmeans_Ti9','kmeans_V3','kmeans_Cu2','kmeans_Cr5','kmeans_Ni3','kmeans_Mo3',
+                        'kmeans_P5','kmeans_Sb2','kmeans_Al4','kmeans_S5','kmeans_N5','kmeans_Ca3','kmeans_B3','kmeans_LE_TB625_6mm5','kmeans_LR_TB625_6mm5','kmeans_ProbBS_100mm3',
+                        'LE_TB625_2mm','LE_TB625_6mm','LE_TB625_12mm','LE_TB625_18mm','LR_TB625_2mm','LR_TB625_6mm','LR_TB625_12mm','LR_TB625_18mm','ProbBS_100mm','ProbBS_50mm')]
+
+
+#salvar os dados---------------------------------------------------------------------------------------------
+write.table(amaco_rep, file="AMACO_REP.csv",row.names=FALSE,sep=";",dec = ",")
